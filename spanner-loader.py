@@ -2,9 +2,11 @@ import re
 import csv
 import gzip
 import uuid
+import math
 import codecs
 import argparse
 import logging
+import concurrent.futures
 from collections import OrderedDict
 from google.oauth2 import service_account
 from google.cloud import storage, spanner
@@ -18,8 +20,24 @@ apply_type = {
     'DATE': lambda x: get_date(x)
 }
 
+def batcher(seq, size):
+    return (seq[pos:pos + size] for pos in range(0, len(seq), size))
+
 def unescaped_str(arg_str):
     return codecs.decode(str(arg_str), 'unicode_escape')
+
+def insert_batch(database,
+                 table_id,
+                 target_col,
+                 batch):
+
+    with database.batch() as db_batch:
+        resp = db_batch.insert(table=table_id,
+                               columns=target_col,
+                               values=batch)
+
+    return resp
+
 
 def download_blob(bucket_name, source_blob_name, destination_file_name):
     """Downloads a blob from the bucket."""
@@ -96,6 +114,7 @@ def load_file(instance_id,
               database_id,
               table_id,
               batchsize,
+              num_threads,
               bucket_name,
               file_name,
               schema_file,
@@ -129,6 +148,9 @@ def load_file(instance_id,
     local_file_name = ''.join(['.spanner_loader_tmp-', str(uuid.uuid4())])
 
     # TODO (djrut): Add exception handling
+    print('Downloading blob gs://{}/{} to local file {}...'
+          .format(bucket_name, file_name, local_file_name))
+
     download_blob(bucket_name, file_name, local_file_name)
 
     # Figure out the source and target column names based on the schema file
@@ -170,6 +192,7 @@ def load_file(instance_id,
         row_cnt = 1
         batch_cnt = 0
         insert_cnt = 0
+        batch_size = batchsize * num_threads
         row_batch = []
 
         for row in reader:
@@ -206,23 +229,33 @@ def load_file(instance_id,
                 batch_cnt += 1
                 insert_cnt += 1
 
-            if (batch_cnt >= batchsize) or (row_cnt == total_rows):
-                if not dry_run:
-                    with database.batch() as batch:
-                      batch.insert(
-                          table=table_id,
-                          columns=target_col,
-                          values=row_batch
-                      )
+            if (batch_cnt >= batch_size) or (row_cnt == total_rows):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                    futures = []
+                    for batch in batcher(row_batch,
+                                         int(math.ceil(batch_cnt/num_threads))):
 
-                    logging.info('Inserted {} rows into table {}'
-                                 .format(batch_cnt, table_id))
-                else:
-                    print('Dry-run batch = {}'
-                          .format(row_batch))
+                        if not dry_run:
+                            futures.append(executor.submit(insert_batch,
+                                                           database,
+                                                           table_id,
+                                                           target_col,
+                                                           batch))
 
-                batch_cnt = 0
-                row_batch = []
+                            logging.debug('Inserted {} rows into table {}'
+                                         .format(len(batch), table_id))
+                        else:
+                            print('Dry-run batch = {}'
+                                  .format(batch))
+
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            data = future.result()
+                        except Exception as err:
+                            logging.error(err.message)
+
+                    batch_cnt = 0
+                    row_batch = []
 
             if row_cnt < total_rows:
                 row_cnt += 1
@@ -288,6 +321,13 @@ if __name__ == '__main__':
         default=32,
         type=int,
         help='The number of rows to insert in a batch'
+    )
+
+    parser.add_argument(
+        '--num-threads',
+        default=8,
+        type=int,
+        help='The number of concurrent load threads to run'
     )
 
     parser.add_argument(
