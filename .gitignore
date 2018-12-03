@@ -1,5 +1,5 @@
 .envrc
-.*.sw$
+.*.sw*
 *.pyc
 .spanner_loader_tmp*
 Session.vim
