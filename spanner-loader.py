@@ -241,9 +241,6 @@ def load_file(instance_id,
                                                            table_id,
                                                            target_col,
                                                            batch))
-
-                            logging.debug('Inserted {} rows into table {}'
-                                         .format(len(batch), table_id))
                         else:
                             print('Dry-run batch = {}'
                                   .format(batch))
@@ -251,6 +248,9 @@ def load_file(instance_id,
                     for future in concurrent.futures.as_completed(futures):
                         try:
                             data = future.result()
+
+                            logging.debug('Inserted {} rows into table {}'
+                                         .format(len(batch), table_id))
                         except Exception as err:
                             logging.error(err.message)
 
